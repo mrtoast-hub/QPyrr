@@ -1,485 +1,351 @@
-
 "use strict";
 
 const {
   Client,
   GatewayIntentBits,
+  Partials,
+  Events,
   REST,
   Routes,
-  EmbedBuilder,
+  SlashCommandBuilder,
+  ChannelType,
   PermissionFlagsBits,
-  ActivityType,
-  Events
+  EmbedBuilder,
+  ActivityType
 } = require("discord.js");
 
 const fs = require("node:fs");
 const path = require("node:path");
 
 const { loadConfig } = require("./config");
-const commands = require("./commands");
 
 const config = loadConfig();
 
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds]
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildInvites
+  ],
+  partials: [Partials.GuildMember]
 });
 
-// -----------------------------------------------
-// SETTINGS STORAGE
-// -----------------------------------------------
-
 const DATA_DIR = path.join(__dirname, "data");
-const DATA_FILE = path.join(DATA_DIR, "settings.json");
+const SETTINGS_FILE = path.join(DATA_DIR, "settings.json");
 
-fs.mkdirSync(DATA_DIR, { recursive: true });
+if (!fs.existsSync(DATA_DIR)) {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+}
 
 function loadSettings() {
   try {
-    if (!fs.existsSync(DATA_FILE)) {
-      return {};
+    if (!fs.existsSync(SETTINGS_FILE)) {
+      return { joinLogChannelId: null };
     }
 
     const data = JSON.parse(
-      fs.readFileSync(DATA_FILE, "utf8")
+      fs.readFileSync(SETTINGS_FILE, "utf8")
     );
 
-    if (!data || typeof data !== "object" || Array.isArray(data)) {
-      return {};
-    }
-
-    return data;
+    return {
+      joinLogChannelId: data.joinLogChannelId || null
+    };
   } catch (error) {
     console.error("[SETTINGS] Failed to load settings:", error);
-    return {};
+    return { joinLogChannelId: null };
   }
 }
 
 let settings = loadSettings();
 
 function saveSettings() {
-  const temporaryFile = `${DATA_FILE}.tmp`;
-
-  try {
-    fs.writeFileSync(
-      temporaryFile,
-      JSON.stringify(settings, null, 2),
-      "utf8"
-    );
-
-    fs.renameSync(temporaryFile, DATA_FILE);
-  } catch (error) {
-    console.error("[SETTINGS] Failed to save settings:", error);
-
-    try {
-      if (fs.existsSync(temporaryFile)) {
-        fs.unlinkSync(temporaryFile);
-      }
-    } catch (cleanupError) {
-      console.error("[SETTINGS] Temporary-file cleanup failed.");
-    }
-
-    throw error;
-  }
+  fs.writeFileSync(
+    SETTINGS_FILE,
+    JSON.stringify(settings, null, 2),
+    "utf8"
+  );
 }
-
-// -----------------------------------------------
-// EMBEDS
-// -----------------------------------------------
 
 function makeEmbed(title, description) {
   return new EmbedBuilder()
-    .setColor(config.embedColor ?? 0x111111)
+    .setColor(0x111111)
     .setTitle(title)
     .setDescription(description)
-    .setFooter({
-      text: "PYRR | Server Protection"
-    })
+    .setFooter({ text: "PYRR | Server Management" })
     .setTimestamp();
 }
 
-// -----------------------------------------------
-// BOT PRESENCE
-// -----------------------------------------------
-
-let previousActivity = -1;
-let presenceTimer = null;
-
-function getServerCount() {
-  return client.guilds.cache.size;
+function isOwner(userId) {
+  return userId === config.ownerId;
 }
 
-function getUserCount() {
-  return client.guilds.cache.reduce(
-    (total, guild) => total + (guild.memberCount || 0),
-    0
+async function sendJoinLog(embed) {
+  if (!settings.joinLogChannelId) {
+    console.warn("[JOIN LOG] No log channel configured.");
+    return false;
+  }
+
+  try {
+    const channel = await client.channels.fetch(
+      settings.joinLogChannelId
+    );
+
+    if (!channel || !channel.isTextBased() || !channel.send) {
+      console.error("[JOIN LOG] Saved channel is unavailable.");
+      return false;
+    }
+
+    await channel.send({ embeds: [embed] });
+    return true;
+  } catch (error) {
+    console.error("[JOIN LOG] Could not send log:", error.message);
+    return false;
+  }
+}
+
+/*
+ * This creates a NEW invite for logging purposes.
+ * It is not necessarily the original invite used to add PYRR.
+ */
+async function createFallbackInvite(guild) {
+  try {
+    const channels = await guild.channels.fetch();
+
+    const candidates = channels.filter(channel =>
+      channel &&
+      channel.type === ChannelType.GuildText &&
+      channel.permissionsFor(guild.members.me)?.has(
+        PermissionFlagsBits.CreateInstantInvite
+      )
+    );
+
+    for (const channel of candidates.values()) {
+      try {
+        const invite = await channel.createInvite({
+          maxAge: 7 * 24 * 60 * 60,
+          maxUses: 0,
+          unique: true,
+          reason: "PYRR server join log"
+        });
+
+        return invite.url;
+      } catch (error) {
+        console.warn(
+          `[INVITE] Could not create invite in #${channel.name}:`,
+          error.message
+        );
+      }
+    }
+
+    return null;
+  } catch (error) {
+    console.error("[INVITE] Could not inspect server channels:", error);
+    return null;
+  }
+}const slashCommands = [
+  new SlashCommandBuilder()
+    .setName("ping")
+    .setDescription("Check PYRR's response time."),
+
+  new SlashCommandBuilder()
+    .setName("join_logs")
+    .setDescription("Set the channel for PYRR server join logs.")
+    .addChannelOption(option =>
+      option
+        .setName("channel")
+        .setDescription("Channel where join logs should be sent.")
+        .addChannelTypes(ChannelType.GuildText)
+        .setRequired(true)
+    )
+].map(command => command.toJSON());
+
+async function registerCommands() {
+  const rest = new REST({ version: "10" }).setToken(config.token);
+
+  await rest.put(
+    Routes.applicationCommands(config.clientId),
+    { body: slashCommands }
   );
+
+  console.log("[COMMANDS] Slash commands registered.");
 }
 
 function updatePyrrPresence() {
-  if (!client.user) {
-    return;
-  }
+  if (!client.user) return;
 
-  const serverCount = getServerCount();
-  const userCount = getUserCount();
+  const serverCount = client.guilds.cache.size;
 
-  const activities = [
-    `Protecting ${serverCount} Servers`,
-    `Protecting ${userCount} Users`,
-    `${serverCount} Servers | ${userCount} Users`,
-    `One Piece | ${serverCount} Servers`,
-    `Protecting ${serverCount} Servers`,
-    `Protecting ${userCount} Users`
-  ];
-
-  let nextActivity = Math.floor(
-    Math.random() * activities.length
+  const userCount = client.guilds.cache.reduce(
+    (total, guild) => total + (guild.memberCount || 0),
+    0
   );
-
-  // Avoid repeating the last activity.
-  if (
-    activities.length > 1 &&
-    nextActivity === previousActivity
-  ) {
-    nextActivity = (nextActivity + 1) % activities.length;
-  }
-
-  previousActivity = nextActivity;
-
-  const activityName = activities[nextActivity];
 
   client.user.setPresence({
     status: "online",
     activities: [
       {
-        name: activityName,
-        type: ActivityType.Playing
+        name: `One Piece | ${serverCount} servers`,
+        type: ActivityType.Watching
       }
     ]
   });
 
-  console.log(`[PRESENCE] Playing ${activityName}`);
-}
-
-// -----------------------------------------------
-// SLASH COMMAND REGISTRATION
-// -----------------------------------------------
-
-async function registerCommands() {
-  const rest = new REST({ version: "10" })
-    .setToken(config.token);
-
-  const commandData = commands.map(command =>
-    command.toJSON()
-  );
-
-  await rest.put(
-    Routes.applicationCommands(config.clientId),
-    {
-      body: commandData
-    }
-  );
-
   console.log(
-    `[COMMANDS] Registered ${commandData.length} slash commands.`
+    `[PRESENCE] Watching One Piece | ${serverCount} servers | ${userCount} users`
   );
 }
-
-// -----------------------------------------------
-// BOT READY
-// -----------------------------------------------
-
-client.once(Events.ClientReady, async readyClient => {
-  console.log("----------------------------------------");
-  console.log(`PYRR online as ${readyClient.user.tag}`);
-  console.log(`Servers: ${getServerCount()}`);
-  console.log(`Users: ${getUserCount()}`);
-  console.log("----------------------------------------");
-
-  updatePyrrPresence();
-
-  if (presenceTimer) {
-    clearInterval(presenceTimer);
-  }
-
-  presenceTimer = setInterval(() => {
-    updatePyrrPresence();
-  }, 60_000);
-
-  try {
-    await registerCommands();
-  } catch (error) {
-    console.error(
-      "[COMMANDS] Registration failed:",
-      error
-    );
-  }
-});
-
-// -----------------------------------------------
-// SLASH COMMAND HANDLER
-// -----------------------------------------------
 
 client.on(Events.InteractionCreate, async interaction => {
-  if (!interaction.isChatInputCommand()) {
-    return;
-  }
+  if (!interaction.isChatInputCommand()) return;
 
   try {
-    // /ping
     if (interaction.commandName === "ping") {
-      const latency = client.ws.ping;
-
       const embed = makeEmbed(
-        "Pong!",
-        [
-          `**WebSocket latency:** ${latency} ms`,
-          "**Status:** Operational"
-        ].join("\n")
+        "PYRR | Pong",
+        `Latency: **${client.ws.ping}ms**`
       );
 
-      return await interaction.reply({
-        embeds: [embed],
-        ephemeral: true
-      });
+      await interaction.reply({ embeds: [embed] });
+      return;
     }
 
-    // /join_logs
     if (interaction.commandName === "join_logs") {
-      // Only the configured bot owner can use this command.
-      if (interaction.user.id !== config.ownerId) {
-        return await interaction.reply({
-          embeds: [
-            makeEmbed(
-              "Access Denied",
-              "This command is restricted to the bot owner."
-            )
-          ],
+      if (!isOwner(interaction.user.id)) {
+        await interaction.reply({
+          content: "This command is restricted to the bot owner.",
           ephemeral: true
         });
+        return;
       }
 
-      if (!interaction.inGuild()) {
-        return await interaction.reply({
-          content: "This command can only be used in a server.",
-          ephemeral: true
-        });
-      }
-
-      const channel = interaction.options.getChannel(
-        "channel",
-        true
-      );
-
-      if (
-        !channel.isTextBased() ||
-        channel.guildId !== interaction.guildId
-      ) {
-        return await interaction.reply({
-          content: "Please select a text channel in this server.",
-          ephemeral: true
-        });
-      }
-
-      const botMember = interaction.guild.members.me;
-
-      if (!botMember) {
-        return await interaction.reply({
-          content: "I could not verify my server permissions.",
-          ephemeral: true
-        });
-      }
-
-      const permissions = channel.permissionsFor(botMember);
-
-      const requiredPermissions = [
-        PermissionFlagsBits.ViewChannel,
-        PermissionFlagsBits.SendMessages,
-        PermissionFlagsBits.EmbedLinks
-      ];
-
-      if (
-        !permissions ||
-        !permissions.has(requiredPermissions)
-      ) {
-        return await interaction.reply({
-          content:
-            "I need View Channel, Send Messages, and Embed Links permissions in that channel.",
-          ephemeral: true
-        });
-      }
-
-      const previousChannelId = settings.joinLogChannelId;
+      const channel = interaction.options.getChannel("channel", true);
 
       settings.joinLogChannelId = channel.id;
-
-      try {
-        saveSettings();
-      } catch (error) {
-        settings.joinLogChannelId = previousChannelId;
-
-        return await interaction.reply({
-          content:
-            "I could not save the settings. Check the host's file permissions and persistent storage.",
-          ephemeral: true
-        });
-      }
+      saveSettings();
 
       const embed = makeEmbed(
         "Join Logs Configured",
-        [
-          `**Log channel:** ${channel}`,
-          "",
-          "PYRR will send a notification to this channel whenever it joins another server.",
-          "",
-          "Only the configured bot owner can change this setting."
-        ].join("\n")
+        `Server join notifications will be sent to ${channel}.\n\n` +
+        "**Note:** This is the global PYRR join-log destination. `settings.json` stores the channel ID.`
       );
 
-      return await interaction.reply({
+      await interaction.reply({
         embeds: [embed],
         ephemeral: true
       });
+
+      console.log(
+        `[JOIN LOG] Destination set to #${channel.name} (${channel.id}) by ${interaction.user.tag}`
+      );
     }
-
-    // A command exists in Discord but is not handled here.
-    return await interaction.reply({
-      content: "This command is not implemented yet.",
-      ephemeral: true
-    });
   } catch (error) {
-    console.error(
-      `[COMMAND ERROR] ${interaction.commandName}:`,
-      error
-    );
+    console.error("[COMMAND ERROR]", error);
 
-    const response = {
-      content:
-        "An unexpected error occurred while running this command.",
+    const reply = {
+      content: "An error occurred while running this command.",
       ephemeral: true
     };
 
     if (interaction.replied || interaction.deferred) {
-      await interaction.followUp(response).catch(() => {});
+      await interaction.followUp(reply).catch(() => {});
     } else {
-      await interaction.reply(response).catch(() => {});
+      await interaction.reply(reply).catch(() => {});
     }
   }
-});
-
-// -----------------------------------------------
-// SERVER JOIN LOGS
-// -----------------------------------------------
-
-client.on(Events.GuildCreate, async guild => {
+});const embed = makeEmbed(
+  "Join Logs Configured",
+  `Server join notifications will be sent to ${channel}.\n\n` +
+  "This is PYRR's global join-log destination."
+);client.on(Events.GuildCreate, async guild => {
   console.log(
-    `[GUILD JOIN] ${guild.name} (${guild.id})`
+    `[GUILD JOIN] Joined ${guild.name} (${guild.id})`
   );
 
-  // Refresh status when the bot joins a server.
-  updatePyrrPresence();
-
-  const channelId = settings.joinLogChannelId;
-
-  if (!channelId) {
-    console.warn("[JOIN LOGS] No log channel configured.");
-    return;
-  }
-
   try {
-    const channel = await client.channels.fetch(channelId);
-
-    if (
-      !channel ||
-      !channel.isTextBased() ||
-      !channel.guild
-    ) {
-      console.error(
-        "[JOIN LOGS] The configured channel is unavailable."
-      );
-      return;
-    }
-
-    let ownerText = "Unavailable";
+    let ownerText = "Unknown";
+    let ownerId = guild.ownerId;
 
     try {
       const owner = await guild.fetchOwner();
-
       ownerText = `${owner.user.tag} (${owner.id})`;
     } catch (error) {
-      console.error(
-        "[JOIN LOGS] Could not fetch server owner:",
-        error
-      );
+      console.warn("[GUILD JOIN] Could not fetch owner:", error.message);
+
+      if (ownerId) {
+        ownerText = `Unknown user (${ownerId})`;
+      }
     }
+
+    const inviteUrl = await createFallbackInvite(guild);
 
     const embed = makeEmbed(
       "PYRR Joined a Server",
       [
         `**Server:** ${guild.name}`,
-        `**Server ID:** ${guild.id}`,
-        `**Server Owner:** ${ownerText}`,
-        `**Member Count:** ${guild.memberCount ?? "Unknown"}`,
+        `**Server ID:** \`${guild.id}\``,
+        `**Owner:** ${ownerText}`,
+        `**Owner ID:** \`${ownerId || "Unknown"}\``,
+        `**Members:** ${guild.memberCount ?? "Unknown"}`,
+        `**Joined:** <t:${Math.floor(Date.now() / 1000)}:F>`,
         "",
-        "PYRR has successfully joined this server.",
-        "",
-        "**Original Invite:** Unavailable"
+        "**Invite Link:**",
+        inviteUrl
+          ? `[Open server invite](${inviteUrl})`
+          : "Unavailable — PYRR lacks permission to create an invite."
       ].join("\n")
     );
 
-    await channel.send({
-      embeds: [embed]
-    });
+    const sent = await sendJoinLog(embed);
 
-    console.log(
-      `[JOIN LOGS] Notification sent for ${guild.name}.`
-    );
+    if (sent) {
+      console.log(`[JOIN LOG] Sent log for ${guild.name}.`);
+    } else {
+      console.warn(
+        `[JOIN LOG] Log for ${guild.name} was not delivered. Configure /join_logs first.`
+      );
+    }
+
+    updatePyrrPresence();
   } catch (error) {
     console.error(
-      "[JOIN LOGS] Failed to send notification:",
+      `[GUILD JOIN] Failed to process ${guild.name}:`,
       error
     );
   }
 });
 
-// -----------------------------------------------
-// SERVER LEAVE
-// -----------------------------------------------
-
 client.on(Events.GuildDelete, guild => {
   console.log(
-    `[GUILD LEAVE] ${guild.name} (${guild.id})`
+    `[GUILD LEAVE] Left or was removed from ${guild.name} (${guild.id})`
   );
 
   updatePyrrPresence();
 });
 
-// -----------------------------------------------
-// ERROR HANDLING
-// -----------------------------------------------
+client.once(Events.ClientReady, async readyClient => {
+  console.log(`[READY] Logged in as ${readyClient.user.tag}`);
+  console.log(`[READY] Connected to ${client.guilds.cache.size} servers.`);
+
+  updatePyrrPresence();
+
+  try {
+    await registerCommands();
+  } catch (error) {
+    console.error("[COMMANDS] Registration failed:", error);
+  }
+
+  setInterval(updatePyrrPresence, 60_000);
+});
 
 client.on(Events.Error, error => {
   console.error("[DISCORD CLIENT ERROR]", error);
-});
-
-client.on(Events.Warn, warning => {
-  console.warn("[DISCORD WARNING]", warning);
 });
 
 process.on("unhandledRejection", error => {
   console.error("[UNHANDLED REJECTION]", error);
 });
 
-process.on("uncaughtException", error => {
-  console.error("[UNCAUGHT EXCEPTION]", error);
-});
-
-// -----------------------------------------------
-// START BOT
-// -----------------------------------------------
-
 client.login(config.token).catch(error => {
-  console.error("[LOGIN ERROR] Could not log in to Discord:", error);
+  console.error("[LOGIN ERROR] PYRR could not log in:", error);
   process.exitCode = 1;
 });
-              
