@@ -1,28 +1,23 @@
 
+"use strict";
+
 const {
   Client,
   GatewayIntentBits,
   REST,
   Routes,
-  SlashCommandBuilder,
   EmbedBuilder,
   PermissionFlagsBits,
-  ChannelType,
   Events
 } = require("discord.js");
 
 const fs = require("node:fs");
 const path = require("node:path");
 
-const TOKEN = process.env.DISCORD_TOKEN;
-const CLIENT_ID = process.env.CLIENT_ID;
-const OWNER_ID = process.env.OWNER_ID;
+const { loadConfig } = require("./config");
+const commands = require("./commands");
 
-if (!TOKEN || !CLIENT_ID || !OWNER_ID) {
-  throw new Error(
-    "Missing DISCORD_TOKEN, CLIENT_ID, or OWNER_ID environment variables."
-  );
-}
+const config = loadConfig();
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds]
@@ -36,7 +31,12 @@ fs.mkdirSync(DATA_DIR, { recursive: true });
 function loadSettings() {
   try {
     if (!fs.existsSync(DATA_FILE)) return {};
-    return JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
+
+    const parsed = JSON.parse(
+      fs.readFileSync(DATA_FILE, "utf8")
+    );
+
+    return parsed && typeof parsed === "object" ? parsed : {};
   } catch (error) {
     console.error("Could not read settings:", error);
     return {};
@@ -47,46 +47,34 @@ let settings = loadSettings();
 
 function saveSettings() {
   const temporaryFile = `${DATA_FILE}.tmp`;
+
   fs.writeFileSync(
     temporaryFile,
     JSON.stringify(settings, null, 2),
     "utf8"
   );
+
   fs.renameSync(temporaryFile, DATA_FILE);
 }
 
 function makeEmbed(title, description) {
   return new EmbedBuilder()
-    .setColor(0x111111)
+    .setColor(config.embedColor)
     .setTitle(title)
     .setDescription(description)
     .setFooter({ text: "PYRR | Server Management" })
     .setTimestamp();
 }
 
-const commands = [
-  new SlashCommandBuilder()
-    .setName("ping")
-    .setDescription("Check the bot's response time."),
-
-  new SlashCommandBuilder()
-    .setName("join_logs")
-    .setDescription("Configure server join notifications.")
-    .addChannelOption(option =>
-      option
-        .setName("channel")
-        .setDescription("Channel that will receive join notifications.")
-        .addChannelTypes(ChannelType.GuildText)
-        .setRequired(true)
-    )
-].map(command => command.toJSON());
-
 async function registerCommands() {
-  const rest = new REST({ version: "10" }).setToken(TOKEN);
+  const rest = new REST({ version: "10" })
+    .setToken(config.token);
 
   await rest.put(
-    Routes.applicationCommands(CLIENT_ID),
-    { body: commands }
+    Routes.applicationCommands(config.clientId),
+    {
+      body: commands.map(command => command.toJSON())
+    }
   );
 
   console.log("Slash commands registered.");
@@ -107,19 +95,19 @@ client.on(Events.InteractionCreate, async interaction => {
 
   try {
     if (interaction.commandName === "ping") {
-      const embed = makeEmbed(
-        "Pong!",
-        `API latency: ${client.ws.ping} ms`
-      );
-
       return interaction.reply({
-        embeds: [embed],
+        embeds: [
+          makeEmbed(
+            "Pong!",
+            `API latency: ${client.ws.ping} ms`
+          )
+        ],
         ephemeral: true
       });
     }
 
     if (interaction.commandName === "join_logs") {
-      if (interaction.user.id !== OWNER_ID) {
+      if (interaction.user.id !== config.ownerId) {
         return interaction.reply({
           embeds: [
             makeEmbed(
@@ -138,20 +126,27 @@ client.on(Events.InteractionCreate, async interaction => {
         });
       }
 
-      const channel = interaction.options.getChannel("channel", true);
+      const channel =
+        interaction.options.getChannel("channel", true);
 
-      if (!channel.isTextBased() || !channel.guild) {
+      if (
+        !channel.isTextBased() ||
+        channel.guildId !== interaction.guildId
+      ) {
         return interaction.reply({
-          content: "Please select a valid text channel.",
+          content:
+            "Please select a text channel in this server.",
           ephemeral: true
         });
       }
 
       const botMember = interaction.guild.members.me;
 
+      const permissions = channel.permissionsFor(botMember);
+
       if (
-        !botMember ||
-        !channel.permissionsFor(botMember)?.has([
+        !permissions ||
+        !permissions.has([
           PermissionFlagsBits.ViewChannel,
           PermissionFlagsBits.SendMessages,
           PermissionFlagsBits.EmbedLinks
@@ -181,7 +176,8 @@ client.on(Events.InteractionCreate, async interaction => {
     console.error("Command error:", error);
 
     const response = {
-      content: "An unexpected error occurred while running this command.",
+      content:
+        "An unexpected error occurred while running this command.",
       ephemeral: true
     };
 
@@ -195,19 +191,27 @@ client.on(Events.InteractionCreate, async interaction => {
 
 client.on(Events.GuildCreate, async guild => {
   const channelId = settings.joinLogChannelId;
+
   if (!channelId) return;
 
   try {
     const channel = await client.channels.fetch(channelId);
-    if (!channel || !channel.isTextBased()) return;
+
+    if (
+      !channel ||
+      !channel.isTextBased() ||
+      !channel.guild
+    ) {
+      return;
+    }
 
     let ownerText = "Unavailable";
 
     try {
       const owner = await guild.fetchOwner();
       ownerText = `${owner.user.tag} (${owner.id})`;
-    } catch {
-      ownerText = "Could not retrieve server owner";
+    } catch (error) {
+      console.error("Could not fetch server owner:", error);
     }
 
     const embed = makeEmbed(
@@ -218,8 +222,8 @@ client.on(Events.GuildCreate, async guild => {
         `**Server Owner:** ${ownerText}`,
         `**Member Count:** ${guild.memberCount}`,
         "",
-        "The bot joined this server successfully.",
-        "Original invite URL: Unavailable"
+        "PYRR has joined this server.",
+        "**Original Invite:** Unavailable"
       ].join("\n")
     );
 
@@ -237,5 +241,5 @@ process.on("unhandledRejection", error => {
   console.error("Unhandled promise rejection:", error);
 });
 
-client.login(TOKEN);
-                   
+client.login(config.token);
+  
